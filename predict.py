@@ -241,10 +241,16 @@ class Predictor(BasePredictor):
     def predict(
         self,
         reference_image: Path = Input(
-            description="Path to the reference image that will be used as the base for the generated video."
+            description="Path to the reference image that will be used as the base for the generated video.",
+            default=None,
         ),
         driving_audio: Path = Input(
-            description="Path to the audio file that will be used to drive the motion in the generated video."
+            description="Path to the audio file that will be used to drive the motion in the generated video.",
+            default=None,
+        ),
+        use_video_audio: bool = Input(
+            description="If True and driving_video is provided, use the audio from the driving video instead of the driving_audio.",
+            default=False,
         ),
         driving_video: Path = Input(
             description="Path to the video file that will be used to extract the head motion. If not provided, the generated video will use the motion based on the selected motion_mode.",
@@ -329,13 +335,17 @@ class Predictor(BasePredictor):
         """Run a single prediction on the model"""
         if seed is None:
             seed = int.from_bytes(os.urandom(2), "big")
-        print(f"Using seed: {seed}")
+        print(f"[!] Using seed: {seed}")
 
         # Reassign input parameters to their original variable names
         output_path = "./output_video.mp4"
-        reference_image_path = str(reference_image)
-        audio_path = str(driving_audio)
-        target_video_path = str(driving_video)
+        reference_image_path = (
+            str(reference_image) if reference_image is not None else reference_image
+        )
+        audio_path = str(driving_audio) if driving_audio is not None else driving_audio
+        target_video_path = (
+            str(driving_video) if driving_video is not None else driving_video
+        )
         standard_audio_sampling_rate = 16000
         fps = frames_per_second
         context_frames = num_context_frames
@@ -352,8 +362,9 @@ class Predictor(BasePredictor):
         elif motion_mode == "fast":
             retarget_strategy = "naive_retarget"
         else:
-            raise ValueError(f"Unsupported motion mode '{motion_mode}'.")
+            raise ValueError(f"[ERROR] Unsupported motion mode '{motion_mode}'.")
 
+        print(f"[~] Loading driving video and extracting keypoints and audio...")
         # Get kps_sequence if target_video_path (i.e. driving_video) is provided
         # We'll use the video to drive the head motion
         if target_video_path is not None:
@@ -368,15 +379,27 @@ class Predictor(BasePredictor):
                 f"python scripts/extract_kps_sequence_and_audio.py --video_path {target_video_path} --kps_sequence_save_path {kps_path} --audio_save_path {temp_audio_path}"
             )
             kps_sequence = torch.load(kps_path)
-            audio_waveform, audio_sampling_rate = torchaudio.load(temp_audio_path)
+
+            if use_video_audio:
+                if (
+                    os.path.exists(temp_audio_path)
+                    and os.path.getsize(temp_audio_path) > 0
+                ):
+                    audio_path = temp_audio_path
+                else:
+                    raise ValueError(
+                        "[ERROR] The driving video does not contain a valid audio stream."
+                    )
         else:
             kps_path = None
             kps_sequence = None
-            _, audio_waveform, meta_info = torchvision.io.read_video(
-                str(audio_path), pts_unit="sec"
-            )
-            audio_sampling_rate = meta_info["audio_fps"]
 
+        if audio_path is None:
+            raise ValueError(
+                "[ERROR] Driving audio is required when driving video is not provided."
+            )
+
+        print(f"[~] Loading and processing reference image...")
         reference_image = Image.open(reference_image_path).convert("RGB")
         reference_image = reference_image.resize((image_width, image_height))
 
@@ -386,14 +409,16 @@ class Predictor(BasePredictor):
         )
         reference_kps = self.app.get(reference_image_for_kps)[0].kps[:3]
 
+        print(f"[~] Loading and processing audio...")
         _, audio_waveform, meta_info = torchvision.io.read_video(
             audio_path, pts_unit="sec"
         )
         audio_sampling_rate = meta_info["audio_fps"]
         print(
-            f"Length of audio is {audio_waveform.shape[1]} with the sampling rate of {audio_sampling_rate}."
+            f"[!] Length of audio is {audio_waveform.shape[1]} with the sampling rate of {audio_sampling_rate}."
         )
         if audio_sampling_rate != standard_audio_sampling_rate:
+            print(f"[~] Resampling audio to {standard_audio_sampling_rate} Hz...")
             audio_waveform = torchaudio.functional.resample(
                 audio_waveform,
                 orig_freq=audio_sampling_rate,
@@ -403,20 +428,27 @@ class Predictor(BasePredictor):
 
         duration = audio_waveform.shape[0] / standard_audio_sampling_rate
         video_length = int(duration * fps)
-        print(f"The corresponding video length is {video_length}.")
+        print(f"[!] The corresponding video length is {video_length} frames.")
 
-        if kps_path != "":
-            assert os.path.exists(kps_path), f"{kps_path} does not exist"
+        if kps_path and kps_path is not None:
+            assert os.path.exists(kps_path), f"[ERROR] {kps_path} does not exist"
+            print(f"[~] Loading keypoints sequence from {kps_path}...")
             kps_sequence = torch.tensor(torch.load(kps_path))  # [len, 3, 2]
-            print(f"The original length of kps sequence is {kps_sequence.shape[0]}.")
+            print(
+                f"[!] The original length of kps sequence is {kps_sequence.shape[0]}."
+            )
+            print(f"[~] Interpolating keypoints sequence to match video length...")
             kps_sequence = torch.nn.functional.interpolate(
                 kps_sequence.permute(1, 2, 0), size=video_length, mode="linear"
             )
             kps_sequence = kps_sequence.permute(2, 0, 1)
             print(
-                f"The interpolated length of kps sequence is {kps_sequence.shape[0]}."
+                f"[!] The interpolated length of kps sequence is {kps_sequence.shape[0]}."
             )
+        else:
+            kps_sequence = None
 
+        print(f"[~] Applying keypoints retargeting strategy: {retarget_strategy}...")
         if retarget_strategy == "fix_face":
             kps_sequence = torch.tensor([reference_kps] * video_length)
         elif retarget_strategy == "no_retarget":
@@ -427,9 +459,10 @@ class Predictor(BasePredictor):
             kps_sequence = retarget_kps(reference_kps, kps_sequence, only_offset=False)
         else:
             raise ValueError(
-                f"The retarget strategy {retarget_strategy} is not supported."
+                f"[ERROR] The retarget strategy {retarget_strategy} is not supported."
             )
 
+        print(f"[~] Generating keypoints images...")
         kps_images = []
         for i in range(video_length):
             kps_image = np.zeros_like(reference_image_for_kps)
@@ -441,10 +474,12 @@ class Predictor(BasePredictor):
         latent_width = image_width // vae_scale_factor
 
         latent_shape = (1, 4, video_length, latent_height, latent_width)
+        print(f"[~] Generating initial latent tensor with shape {latent_shape}...")
         vae_latents = randn_tensor(
             latent_shape, generator=generator, device=self.device, dtype=self.dtype
         )
 
+        print(f"[~] Running main video generation pipeline...")
         video_latents = self.pipeline(
             vae_latents=vae_latents,
             reference_image=reference_image,
@@ -464,10 +499,13 @@ class Predictor(BasePredictor):
             generator=generator,
         ).video_latents
 
+        print(f"[~] Decoding latents into video tensor...")
         video_tensor = self.pipeline.decode_latents(video_latents)
         if isinstance(video_tensor, np.ndarray):
             video_tensor = torch.from_numpy(video_tensor)
 
+            print(f"[~] Saving generated video to {output_path}...")
             save_video(video_tensor, audio_path, output_path, fps)
 
-        return Path(output_path)
+            print(f"[!] Video generation completed. Output saved to {output_path}")
+            return Path(output_path)
